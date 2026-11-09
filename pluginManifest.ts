@@ -1,4 +1,21 @@
 import type { PrinterPreset } from '../../src/features/profiles/profileStore';
+import elegooMarsPrinters from '../elegoo/printers/mars-series.json';
+import elegooSaturnPrinters from '../elegoo/printers/saturn-series.json';
+
+const SDCP_V1_PRESET_IDS = new Set([
+  'elegoo-saturn-3-ctb',
+  'elegoo-saturn-2-ctb',
+  'elegoo-mars-3-ctb',
+  'elegoo-mars-3-pro-ctb',
+]);
+
+const SDCP_V1_PRINTER_PRESETS = [...elegooSaturnPrinters, ...elegooMarsPrinters]
+  .filter((preset) => SDCP_V1_PRESET_IDS.has(preset.presetId))
+  .map((preset) => ({
+    ...preset,
+    imageAssetPath: `/plugins/elegoo/printers/${preset.imageAssetPath.replace(/^\.\//, '')}`,
+    networkSupport: 'sdcp-v1',
+  }));
 
 export const SDCP_V1_PLUGIN_MANIFEST = {
   schemaVersion: 1,
@@ -38,6 +55,7 @@ export const SDCP_V1_PLUGIN_MANIFEST = {
         mirrorY: false,
       },
     } satisfies PrinterPreset,
+    ...SDCP_V1_PRINTER_PRESETS,
   ],
   materialTemplates: [],
 };

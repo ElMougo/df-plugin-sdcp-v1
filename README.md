@@ -1,7 +1,7 @@
 # df-plugin-sdcp-v1
 
 DragonFruit support for printers using SDCP v1 over MQTT, including the Elegoo
-Saturn 3 Ultra.
+Saturn 3 Ultra, Saturn 3, Saturn 2 (8K), Mars 3, and Mars 3 Pro.
 
 ## Transport
 
