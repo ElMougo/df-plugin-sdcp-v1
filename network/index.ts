@@ -66,9 +66,10 @@ function toBase64(bytes: Uint8Array): string {
 }
 
 function uploadId(): string {
-  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-    ? crypto.randomUUID()
-    : `sdcp-v1-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID().replaceAll('-', '');
+  }
+  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
 }
 
 async function post(operation: string, payload: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -96,24 +97,26 @@ export async function uploadPrintJobWithProgress(args: {
   callbacks: UploadCallbacks;
 }): Promise<{ ok: boolean; plateId: number | null }> {
   const { hostUrl, zipBlob, zipFilePath, path, callbacks } = args;
-  const { host, port } = toHost(hostUrl);
-  const nativePath = typeof zipFilePath === 'string' ? zipFilePath.trim() : '';
-  const hasBlob = Boolean(zipBlob && zipBlob.size > 0);
-  if (!hasBlob && !nativePath) throw new Error('No SDCP v1 upload payload is available.');
-
-  const totalSize = hasBlob
-    ? zipBlob!.size
-    : await readNativeFileSize(nativePath);
-  if (!Number.isFinite(totalSize) || totalSize == null || totalSize <= 0) {
-    throw new Error('Could not read the SDCP v1 print file.');
-  }
-
-  const uuid = uploadId();
-  const fileName = `${path.trim() || 'dragonfruit_job'}.ctb`;
-  const startedAt = Date.now();
-  callbacks.onStatusUpdate({ stage: 'uploading', message: 'Preparing print file for SDCP v1…' });
-
+  let phase = 'validating upload';
   try {
+    const { host, port } = toHost(hostUrl);
+    const nativePath = typeof zipFilePath === 'string' ? zipFilePath.trim() : '';
+    const hasBlob = Boolean(zipBlob && zipBlob.size > 0);
+    if (!hasBlob && !nativePath) throw new Error('No SDCP v1 upload payload is available.');
+
+    const totalSize = hasBlob
+      ? zipBlob!.size
+      : await readNativeFileSize(nativePath);
+    if (!Number.isFinite(totalSize) || totalSize == null || totalSize <= 0) {
+      throw new Error('Could not read the SDCP v1 print file.');
+    }
+
+    const uuid = uploadId();
+    const fileName = `${path.trim() || 'dragonfruit_job'}.ctb`;
+    const startedAt = Date.now();
+    phase = 'staging file chunks';
+    callbacks.onStatusUpdate({ stage: 'uploading', message: 'Preparing print file for SDCP v1…' });
+
     let offset = 0;
     while (offset < totalSize) {
       const end = Math.min(totalSize, offset + CHUNK_BYTES);
@@ -151,6 +154,7 @@ export async function uploadPrintJobWithProgress(args: {
       });
     }
 
+    phase = 'transferring file to printer';
     const result = await post('upload/finish', { host, port, uuid });
     const plateId = typeof result.plateId === 'number' ? result.plateId : null;
     callbacks.onStatusUpdate({ stage: 'complete', message: 'SDCP v1 upload complete.', plateId });
@@ -158,6 +162,7 @@ export async function uploadPrintJobWithProgress(args: {
     return { ok: true, plateId };
   } catch (error) {
     const message = error instanceof Error ? error.message : 'SDCP v1 upload failed.';
+    console.error(`[SDCP v1] Upload failed while ${phase}`, { error: message });
     callbacks.onStatusUpdate({ stage: 'error', message: 'SDCP v1 upload failed.', error: message });
     callbacks.onError?.(message);
     throw error;

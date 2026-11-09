@@ -13,14 +13,18 @@ SDCP v1 differs from the WebSocket-based SDCP v3 transport:
   status use `/sdcp/request/<MainboardID>`, `/sdcp/response/<MainboardID>`,
   and `/sdcp/status/<MainboardID>`.
 - For file transfer, DragonFruit serves the print file over HTTP while the
-  printer downloads it.
+  printer downloads it. The URL uses SDCP v1's `${ipaddr}` host placeholder,
+  which the printer resolves to the controller address.
 
 The printer and DragonFruit must be on the same reachable LAN. The desktop
 firewall must allow incoming MQTT and HTTP connections on the dynamically
 selected local ports.
 
 The v1 protocol does not expose the v3 plate listing, webcam, or remote
-material-profile operations. `M99999` status is used for monitoring.
+material-profile operations. The empty plate-list response reports
+`metadataReady: true`: once command 256 confirms the file transfer, v1 has no
+separate plate-metadata import step to wait for. `M99999` status is used for
+monitoring.
 
 ## Commands
 

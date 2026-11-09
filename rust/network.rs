@@ -601,6 +601,7 @@ fn serve_file(
     listener: TcpListener,
     path: PathBuf,
     expected_name: String,
+    digest: String,
     cancelled: &AtomicBool,
 ) -> Result<(), String> {
     listener
@@ -648,10 +649,10 @@ fn serve_file(
             .len();
         write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nETag: {digest}\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
         )
         .map_err(|error| format!("Could not respond to SDCP v1 file probe: {error}"))?;
-        return serve_file(listener, path, expected_name, cancelled);
+        return serve_file(listener, path, expected_name, digest, cancelled);
     }
     if !request_line.starts_with(&format!("GET {expected_path} ")) {
         let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -665,7 +666,7 @@ fn serve_file(
         .len();
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nETag: {digest}\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n"
     )
     .and_then(|_| std::io::copy(&mut file, &mut stream).map(|_| ()))
     .map_err(|error| format!("Could not serve SDCP v1 print file: {error}"))
@@ -687,15 +688,7 @@ fn upload_file(host: Ipv4Addr, payload: &Value) -> Result<Value, String> {
         (entry.file_path.clone(), entry.file_name.clone(), entry.total_size)
     };
     let digest = file_md5(&entry.0)?;
-    let udp = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
-        .map_err(|error| error.to_string())?;
-    udp.connect(SocketAddrV4::new(host, DISCOVERY_PORT))
-        .map_err(|error| error.to_string())?;
-    let local_ip = match udp.local_addr().map_err(|error| error.to_string())?.ip() {
-        IpAddr::V4(address) => address,
-        _ => return Err("SDCP v1 requires IPv4".to_string()),
-    };
-    let http_listener = TcpListener::bind(SocketAddrV4::new(local_ip, 0))
+    let http_listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .map_err(|error| format!("Could not start SDCP v1 file server: {error}"))?;
     let http_port = http_listener
         .local_addr()
@@ -706,9 +699,20 @@ fn upload_file(host: Ipv4Addr, payload: &Value) -> Result<Value, String> {
     let cancelled = Arc::new(AtomicBool::new(false));
     let server_path = entry.0.clone();
     let server_name = http_name.clone();
+    let server_digest = digest.clone();
     let server_cancelled = Arc::clone(&cancelled);
     let server = std::thread::spawn(move || {
-        serve_file(http_listener, server_path, server_name, &server_cancelled)
+        let result = serve_file(
+            http_listener,
+            server_path,
+            server_name,
+            server_digest,
+            &server_cancelled,
+        );
+        if let Err(error) = &result {
+            log::error!("[sdcp-v1] HTTP file server failed: {error}");
+        }
+        result
     });
     let command = json!({
         "Check": 0,
@@ -717,7 +721,7 @@ fn upload_file(host: Ipv4Addr, payload: &Value) -> Result<Value, String> {
         "FileSize": entry.2,
         "Filename": entry.1,
         "MD5": digest,
-        "URL": format!("http://{local_ip}:{http_port}/{http_name}"),
+        "URL": format!("http://${{ipaddr}}:{http_port}/{http_name}"),
     });
     if let Err(error) = session.request(256, command) {
         cancelled.store(true, Ordering::Relaxed);
@@ -747,15 +751,8 @@ fn upload_file(host: Ipv4Addr, payload: &Value) -> Result<Value, String> {
             if topic != format!("/sdcp/status/{}", session.mainboard_id) {
                 continue;
             }
-            let Some(file_transfer) = status.pointer("/Data/Status/FileTransferInfo") else {
-                continue;
-            };
-            let transfer_status = file_transfer.get("Status").and_then(Value::as_i64).unwrap_or(0);
-            if transfer_status == 2 {
-                return Ok(());
-            }
-            if transfer_status == 3 {
-                return Err("The SDCP v1 printer reported a file transfer error".to_string());
+            if let Some(result) = file_transfer_completion(&status) {
+                return result;
             }
         }
         Err("Timed out waiting for the SDCP v1 printer to finish downloading the file".to_string())
@@ -783,6 +780,32 @@ fn stable_plate_id(file_name: &str) -> i64 {
         value = value.wrapping_mul(16777619);
     }
     i64::from((value & 0x7fff_ffff).max(1))
+}
+
+fn file_transfer_completion(status: &Value) -> Option<Result<(), String>> {
+    let status_data = status.pointer("/Data/Status")?;
+    if status_data.get("CurrentStatus").and_then(Value::as_i64) != Some(0) {
+        return None;
+    }
+    let file_transfer = status_data.get("FileTransferInfo")?;
+    let transfer_status = file_transfer.get("Status").and_then(Value::as_i64).unwrap_or(0);
+    let downloaded = file_transfer
+        .get("DownloadOffset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total = file_transfer
+        .get("FileTotalSize")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    match transfer_status {
+        2 => Some(Ok(())),
+        3 => Some(Err(format!(
+            "The SDCP v1 printer reported a file transfer error after downloading {downloaded} of {total} bytes"
+        ))),
+        status => Some(Err(format!(
+            "The SDCP v1 printer returned to ready state with unexpected file transfer status {status} ({downloaded} of {total} bytes)"
+        ))),
+    }
 }
 
 fn control(host: Ipv4Addr, command: u16, payload: &Value) -> Result<Value, String> {
@@ -874,7 +897,14 @@ fn dispatch(operation: &str, payload: &Value) -> (u16, Value) {
                 "message": "SDCP v1 does not provide webcam endpoints.",
             }),
         ),
-        "plates/list/json" => (200, json!({ "ok": true, "plates": [] })),
+        "plates/list/json" => (
+            200,
+            json!({
+                "ok": true,
+                "plates": [],
+                "metadataReady": true,
+            }),
+        ),
         "materials" | "materials/edit" | "unsupported" => {
             (404, json!({ "error": "Remote material profiles are not supported by SDCP v1." }))
         }
@@ -938,10 +968,25 @@ pub async fn dispatch_plugin_network_request(request_json: String) -> Result<Plu
             body: json!({ "error": "operation is required" }),
         });
     }
-    let (status, body) = tokio::task::spawn_blocking(move || dispatch(&operation, &request))
-        .await
-        .map_err(|error| format!("SDCP v1 network operation failed: {error}"))?;
-    Ok(PluginNetworkResponse { status, body })
+    let log_operation = operation.clone();
+    match tokio::task::spawn_blocking(move || dispatch(&operation, &request)).await {
+        Ok((status, body)) => {
+            if status >= 400 {
+                let error = body
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Unknown SDCP v1 network error");
+                log::error!(
+                    "[sdcp-v1] Operation {log_operation} failed (HTTP {status}): {error}"
+                );
+            }
+            Ok(PluginNetworkResponse { status, body })
+        }
+        Err(error) => {
+            log::error!("[sdcp-v1] Operation {log_operation} task failed: {error}");
+            Err(format!("SDCP v1 network operation failed: {error}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -981,5 +1026,50 @@ mod tests {
         assert_eq!(status["progressPct"], 25.0);
         assert_eq!(status["stateText"], "Printing");
         assert_eq!(status["jobName"], "part.ctb");
+    }
+
+    #[test]
+    fn waits_for_printer_ready_before_treating_transfer_status_as_final() {
+        let stale_error = json!({
+            "Data": {
+                "Status": {
+                    "CurrentStatus": 1,
+                    "FileTransferInfo": {
+                        "Status": 3,
+                        "DownloadOffset": 0,
+                        "FileTotalSize": 100,
+                    },
+                },
+            },
+        });
+        assert!(file_transfer_completion(&stale_error).is_none());
+    }
+
+    #[test]
+    fn reports_final_transfer_status_with_download_progress() {
+        let failed = json!({
+            "Data": {
+                "Status": {
+                    "CurrentStatus": 0,
+                    "FileTransferInfo": {
+                        "Status": 3,
+                        "DownloadOffset": 25,
+                        "FileTotalSize": 100,
+                    },
+                },
+            },
+        });
+        assert_eq!(
+            file_transfer_completion(&failed).unwrap().unwrap_err(),
+            "The SDCP v1 printer reported a file transfer error after downloading 25 of 100 bytes"
+        );
+    }
+
+    #[test]
+    fn reports_metadata_ready_for_v1_after_upload_success() {
+        let (_, response) = dispatch("plates/list/json", &json!({}));
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["plates"], json!([]));
+        assert_eq!(response["metadataReady"], true);
     }
 }
